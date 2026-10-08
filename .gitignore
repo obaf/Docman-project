@@ -15,6 +15,10 @@ override.tf.json
 .terraformrc
 terraform.rc
 
+# Keys
+*.pem
+*.key
+
 # OS / editor
 .DS_Store
 Thumbs.db

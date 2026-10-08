@@ -1,0 +1,163 @@
+#!/bin/bash
+# Installs Oracle Database Free and creates the SCOTT schema (EMP, DEPT).
+# Runs once, as root, at first boot via cloud-init. Takes ~20 min on a t3.small.
+#
+#   progress : sudo tail -f /var/log/oracle-setup.log
+#   finished : /var/log/oracle-setup.done exists
+set -euo pipefail
+exec > >(tee -a /var/log/oracle-setup.log) 2>&1
+echo "### $(date -u) oracle setup: start"
+
+ORACLE_PWD='${oracle_password}'
+SCOTT_PWD='${scott_password}'
+RPM_URL='${oracle_rpm_url}'
+PREINSTALL_URL='${oracle_preinstall_rpm_url}'
+
+###############################################################################
+# 1. OS preparation
+###############################################################################
+# Permissive SELinux avoids install-time denials on a throwaway demo box.
+setenforce 0 || true
+sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config
+
+# Oracle's minimum is 2 GB RAM; swap and a bigger /dev/shm give a small
+# instance the headroom the database creation step needs.
+if ! swapon --show --noheadings | grep -q /swapfile; then
+  fallocate -l 4G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+mount -o remount,size=2g /dev/shm
+echo 'tmpfs /dev/shm tmpfs defaults,size=2g 0 0' >> /etc/fstab
+
+###############################################################################
+# 2. Oracle preinstall package: oracle user + groups, kernel params, limits
+###############################################################################
+dnf install -y epel-release dnf-plugins-core
+dnf config-manager --set-enabled crb
+
+PRE=/var/tmp/oracle-preinstall.rpm
+curl -fsSL --retry 5 -o "$PRE" "$PREINSTALL_URL"
+
+# Install every dependency this distro ships. A couple of names exist only in
+# Oracle Linux's repos; the package itself goes on with --nodeps if dnf balks.
+dnf install -y --setopt=strict=0 --skip-broken \
+  $(rpm -qpR "$PRE" | grep -vE '^(rpmlib|/)' | awk '{print $1}' | sort -u) || true
+dnf install -y "$PRE" || rpm -ivh --nodeps "$PRE"
+
+###############################################################################
+# 3. Oracle Database Free software (~1.5 GB download, ~10 GB installed)
+###############################################################################
+DB=/var/tmp/oracle-free.rpm
+echo "### $(date -u) downloading $RPM_URL"
+curl -fsSL --retry 5 -o "$DB" "$RPM_URL"
+echo "### $(date -u) installing RPM"
+dnf install -y "$DB" || rpm -ivh --nodeps "$DB"
+rm -f "$DB" "$PRE"
+
+ORACLE_HOME=$(ls -d /opt/oracle/product/*/dbhomeFree | head -n 1)
+INIT=$(ls /etc/init.d/oracle-free-* | head -n 1)
+SERVICE=$(basename "$INIT")
+CONF=/etc/sysconfig/$SERVICE.conf
+echo "### ORACLE_HOME=$ORACLE_HOME service=$SERVICE"
+
+###############################################################################
+# 4. Create the database: CDB "FREE" with pluggable database "FREEPDB1"
+###############################################################################
+# The memory/space validation would reject a 2 GB box; swap covers it.
+sed -i 's/^SKIP_VALIDATIONS=.*/SKIP_VALIDATIONS=true/' "$CONF"
+
+echo "### $(date -u) running configure (this is the slow part)"
+"$INIT" configure <<EOF
+$ORACLE_PWD
+$ORACLE_PWD
+EOF
+
+systemctl daemon-reload
+systemctl enable "$SERVICE" || chkconfig "$SERVICE" on || true
+
+###############################################################################
+# 5. Make sqlplus usable by anyone who logs in
+###############################################################################
+cat > /etc/profile.d/oracle.sh <<EOF
+export ORACLE_HOME=$ORACLE_HOME
+export ORACLE_SID=FREE
+export PATH=$ORACLE_HOME/bin:\$PATH
+EOF
+usermod -aG oinstall,dba ec2-user
+
+if systemctl is-active --quiet firewalld; then
+  firewall-cmd --permanent --add-port=1521/tcp
+  firewall-cmd --reload
+fi
+
+###############################################################################
+# 6. SCOTT schema in FREEPDB1
+###############################################################################
+cat > /var/tmp/scott.sql <<EOF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+-- Reopen the PDB automatically after every restart.
+ALTER PLUGGABLE DATABASE FREEPDB1 SAVE STATE;
+ALTER SESSION SET CONTAINER = FREEPDB1;
+
+CREATE USER scott IDENTIFIED BY "$SCOTT_PWD"
+  DEFAULT TABLESPACE users QUOTA UNLIMITED ON users;
+GRANT CREATE SESSION, CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE PROCEDURE TO scott;
+
+ALTER SESSION SET CURRENT_SCHEMA = scott;
+
+CREATE TABLE dept (
+  deptno NUMBER(2) CONSTRAINT pk_dept PRIMARY KEY,
+  dname  VARCHAR2(14),
+  loc    VARCHAR2(13)
+);
+
+CREATE TABLE emp (
+  empno    NUMBER(4) CONSTRAINT pk_emp PRIMARY KEY,
+  ename    VARCHAR2(10),
+  job      VARCHAR2(9),
+  mgr      NUMBER(4),
+  hiredate DATE,
+  sal      NUMBER(7,2),
+  comm     NUMBER(7,2),
+  deptno   NUMBER(2) CONSTRAINT fk_deptno REFERENCES dept
+);
+
+INSERT INTO dept VALUES (10, 'ACCOUNTING', 'NEW YORK');
+INSERT INTO dept VALUES (20, 'RESEARCH',   'DALLAS');
+INSERT INTO dept VALUES (30, 'SALES',      'CHICAGO');
+INSERT INTO dept VALUES (40, 'OPERATIONS', 'BOSTON');
+
+INSERT INTO emp VALUES (7369, 'SMITH',  'CLERK',     7902, DATE '1980-12-17',  800, NULL, 20);
+INSERT INTO emp VALUES (7499, 'ALLEN',  'SALESMAN',  7698, DATE '1981-02-20', 1600,  300, 30);
+INSERT INTO emp VALUES (7521, 'WARD',   'SALESMAN',  7698, DATE '1981-02-22', 1250,  500, 30);
+INSERT INTO emp VALUES (7566, 'JONES',  'MANAGER',   7839, DATE '1981-04-02', 2975, NULL, 20);
+INSERT INTO emp VALUES (7654, 'MARTIN', 'SALESMAN',  7698, DATE '1981-09-28', 1250, 1400, 30);
+INSERT INTO emp VALUES (7698, 'BLAKE',  'MANAGER',   7839, DATE '1981-05-01', 2850, NULL, 30);
+INSERT INTO emp VALUES (7782, 'CLARK',  'MANAGER',   7839, DATE '1981-06-09', 2450, NULL, 10);
+INSERT INTO emp VALUES (7788, 'SCOTT',  'ANALYST',   7566, DATE '1987-04-19', 3000, NULL, 20);
+INSERT INTO emp VALUES (7839, 'KING',   'PRESIDENT', NULL, DATE '1981-11-17', 5000, NULL, 10);
+INSERT INTO emp VALUES (7844, 'TURNER', 'SALESMAN',  7698, DATE '1981-09-08', 1500,    0, 30);
+INSERT INTO emp VALUES (7876, 'ADAMS',  'CLERK',     7788, DATE '1987-05-23', 1100, NULL, 20);
+INSERT INTO emp VALUES (7900, 'JAMES',  'CLERK',     7698, DATE '1981-12-03',  950, NULL, 30);
+INSERT INTO emp VALUES (7902, 'FORD',   'ANALYST',   7566, DATE '1981-12-03', 3000, NULL, 20);
+INSERT INTO emp VALUES (7934, 'MILLER', 'CLERK',     7782, DATE '1982-01-23', 1300, NULL, 10);
+COMMIT;
+EXIT
+EOF
+chown oracle:oinstall /var/tmp/scott.sql
+
+echo "### $(date -u) creating SCOTT schema"
+su - oracle -c "ORACLE_HOME=$ORACLE_HOME ORACLE_SID=FREE $ORACLE_HOME/bin/sqlplus -s / as sysdba @/var/tmp/scott.sql"
+rm -f /var/tmp/scott.sql
+
+###############################################################################
+# 7. Self-test, then mark done
+###############################################################################
+echo "### self-test: select count(*) from emp as SCOTT"
+su - oracle -c "ORACLE_HOME=$ORACLE_HOME $ORACLE_HOME/bin/sqlplus -s scott/$SCOTT_PWD@localhost/FREEPDB1 <<< 'select count(*) as emp_rows from emp;'"
+
+touch /var/log/oracle-setup.done
+echo "### $(date -u) oracle setup: done"
