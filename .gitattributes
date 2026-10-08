@@ -1,0 +1,4 @@
+# Scripts are shipped to Linux hosts verbatim (EC2 user-data); CRLF would break them.
+*.tftpl text eol=lf
+*.sh    text eol=lf
+*.sql   text eol=lf
